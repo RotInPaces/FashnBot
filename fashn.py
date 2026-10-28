@@ -158,14 +158,21 @@ _FIDELITY = {
 }
 
 
-async def generate_from_garment(product_image: str, prompt: str, aspect_ratio: str = "2:3") -> bytes:
-    """Фото вещи → новый человек. Внешность, поза и интерьер задаёт prompt."""
+async def generate_from_garment(
+    product_image: str,
+    prompt: str,
+    aspect_ratio: str = "2:3",
+    pose_image: str = "",
+) -> bytes:
+    """Фото вещи → новый человек. pose_image задаёт только стойку."""
     inputs = {
         "product_image": product_image,
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
         **_FIDELITY,
     }
+    if pose_image:
+        inputs["image_prompt"] = pose_image
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
         return await _run(client, inputs, "product-to-model")
 
@@ -189,11 +196,14 @@ _PACKSHOT_PROMPTS = {
 }
 
 
-async def generate_on_hanger(product_image: str, placement: str = "hanger") -> bytes:
+async def generate_on_hanger(product_image: str, placement: str = "hanger", note: str = "") -> bytes:
     """Фото вещи → кадр без человека: вешалка, кровать или пол."""
+    prompt = _PACKSHOT_PROMPTS.get(placement, _PACKSHOT_PROMPTS["hanger"])
+    if note:
+        prompt += f" User correction: {note}. Keep every other garment detail unchanged."
     inputs = {
         "product_image": product_image,
-        "prompt": _PACKSHOT_PROMPTS.get(placement, _PACKSHOT_PROMPTS["hanger"]),
+        "prompt": prompt,
         "aspect_ratio": "3:4",
         **_FIDELITY,
     }
@@ -201,16 +211,19 @@ async def generate_on_hanger(product_image: str, placement: str = "hanger") -> b
         return await _run(client, inputs, "packshot")
 
 
-async def generate_tryon(product_image: str, model_image: str) -> bytes:
+async def generate_tryon(product_image: str, model_image: str, note: str = "") -> bytes:
     """Фото человека + фото вещи. Поза и фон человека сохраняются."""
+    prompt = (
+        "Copy the garment from the product photo exactly: same color, print, fabric, "
+        "stitching, pockets, buttons, zippers, logos, length and shape. "
+        "Do not add details that are not in the product photo. Do not recolor it."
+    )
+    if note:
+        prompt += f" User correction: {note}. Keep every other garment detail unchanged."
     inputs = {
         "product_image": product_image,
         "model_image": model_image,
-        "prompt": (
-            "Copy the garment from the product photo exactly: same color, print, fabric, "
-            "stitching, pockets, buttons, zippers, logos, length and shape. "
-            "Do not add details that are not in the product photo. Do not recolor it."
-        ),
+        "prompt": prompt,
         **_FIDELITY,
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:

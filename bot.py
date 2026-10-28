@@ -84,12 +84,19 @@ GENDERS: dict[str, str] = {
     "f": "Женский",
     "m": "Мужской",
 }
+LOOKS: dict[str, str] = {
+    "plain": "Обычная",
+    "groomed": "Ухоженная",
+}
 FRAMES: dict[str, str] = {
-    "full": "Полный рост",
-    "turn": "Полный рост, поворот",
+    "full": "Стоит ровно",
+    "relax": "Свободно стоит",
+    "turn": "Лёгкий поворот",
+    "walk": "На ходу",
     "knee": "По колено",
     "waist": "По пояс",
-    "sit": "Сидя",
+    "sit": "Сидит",
+    "custom": "Своя поза",
 }
 ORIGIN_LOOK: dict[str, str] = {
     "ru": "Russian, natural Slavic features",
@@ -100,18 +107,23 @@ ORIGIN_LOOK: dict[str, str] = {
     "af": "African, natural features",
 }
 FRAME_PROMPTS: dict[str, str] = {
-    "full": "full-body shot, standing straight, head to shoes in frame",
-    "turn": "full-body three-quarter side view, head to shoes in frame, same garment construction visible from the side",
-    "knee": "shot from head to knees, standing",
-    "waist": "waist-up shot, upper body in frame",
-    "sit": "sitting on a simple chair, garment visible, relaxed pose",
+    "full": "full-body photo, standing naturally, looking at the camera, clothes fully visible",
+    "relax": "full-body photo, relaxed stance with weight on one leg, arms natural, looking at the camera, as if showing new clothes",
+    "turn": "full-body three-quarter view, head to shoes in frame, same garment visible from the side, looking toward the camera",
+    "walk": "casual mid-step walk, clothes fully visible, natural arms, looking ahead",
+    "knee": "photo from head to knees, standing naturally, looking at the camera",
+    "waist": "waist-up photo, looking at the camera, garment details visible",
+    "sit": "sitting naturally, garment visible, looking at the camera",
 }
 FRAME_RATIOS: dict[str, str] = {
     "full": "2:3",
+    "relax": "2:3",
     "turn": "2:3",
+    "walk": "2:3",
     "knee": "3:4",
     "waist": "3:4",
     "sit": "3:4",
+    "custom": "2:3",
 }
 INTERIOR_PROMPTS: dict[str, str] = {
     "mirror": "in a home hallway by a mirror, soft daylight",
@@ -151,6 +163,13 @@ class Flow(StatesGroup):
     person = State()
     tryon_garment = State()
     hanger = State()
+    regen = State()
+    pose = State()
+
+
+_last_job: dict[int, dict] = {}
+# Своя поза: data URI только в памяти, на диск не пишем.
+_pose_ref: dict[int, str] = {}
 
 
 # Рубли и кредиты. Подставляются в QR, когда появится банк.
@@ -227,6 +246,7 @@ def _blank_user(balance: int) -> dict:
         "frame": "full",
         "shot": "self",
         "season": "summer",
+        "look": "plain",
     }
 
 
@@ -247,6 +267,7 @@ async def ensure_user(user_id: int) -> dict:
             "frame": "full",
             "shot": "self",
             "season": "summer",
+            "look": "plain",
         }
         for field, default in defaults.items():
             if field not in user:
@@ -266,6 +287,7 @@ async def update_prefs(
     frame: str | None = None,
     shot: str | None = None,
     season: str | None = None,
+    look: str | None = None,
 ) -> dict:
     async with _balance_lock:
         data = _load_balances()
@@ -285,6 +307,8 @@ async def update_prefs(
             user["shot"] = shot
         if season in SEASONS:
             user["season"] = season
+        if look in LOOKS:
+            user["look"] = look
         data[key] = user
         _save_balances(data)
         return dict(user)
@@ -320,11 +344,31 @@ async def add_credits(user_id: int, amount: int) -> int:
         return int(user["balance"])
 
 
-def prompt_for(user: dict) -> str:
+def appearance_prompt(user: dict) -> str:
     gender = "woman" if user.get("gender") != "m" else "man"
-    look = ORIGIN_LOOK.get(str(user.get("origin")), ORIGIN_LOOK["ru"])
+    features = ORIGIN_LOOK.get(str(user.get("origin")), ORIGIN_LOOK["ru"])
+    if user.get("look") == "groomed":
+        styling = (
+            f"well-groomed young {gender}, {features}, styled tidy hair, fresh rested face, "
+            "polished fashion-model appearance, realistic skin"
+        )
+    else:
+        styling = (
+            f"ordinary young {gender}, {features}, clean brushed hair, fresh rested face, "
+            "simple everyday look, not a fashion model"
+        )
+    return styling + ", not tired, not exhausted, no messy or unkempt hair"
+
+
+def prompt_for(user: dict, *, pose_photo: bool = False) -> str:
     interior = INTERIOR_PROMPTS.get(str(user.get("interior")), INTERIOR_PROMPTS["mirror"])
-    frame = FRAME_PROMPTS.get(str(user.get("frame")), FRAME_PROMPTS["full"])
+    if pose_photo:
+        frame = (
+            "Match only the body pose from the pose reference: stance, arms, legs, head angle and crop. "
+            "Do not copy that reference person's face, hair, identity, clothes, colors, lighting or room"
+        )
+    else:
+        frame = FRAME_PROMPTS.get(str(user.get("frame")), FRAME_PROMPTS["full"])
     shot = SHOT_PROMPTS.get(str(user.get("shot")), SHOT_PROMPTS["self"])
     if user.get("shot", "self") == "self" and user.get("interior") != "mirror":
         shot = "casual smartphone photo, realistic product review photo"
@@ -335,7 +379,7 @@ def prompt_for(user: dict) -> str:
         "Copy the garment from the product photo exactly: same color, print, fabric, "
         "stitching, pockets, buttons, zippers, logos, length and shape. "
         "Do not add, remove or recolor any detail. Do not invent another jacket or an extra layer. "
-        f"The person is an ordinary young {gender}, {look}, not a professional model. "
+        f"The person is {appearance_prompt(user)}. "
         f"{frame}. {interior}, {season}{shot}."
     )
 
@@ -344,13 +388,22 @@ def aspect_for(user: dict) -> str:
     return FRAME_RATIOS.get(str(user.get("frame")), FRAME_RATIOS["full"])
 
 
-def prefs_line(user: dict) -> str:
+def pose_photo(user_id: int, user: dict) -> str:
+    if user.get("frame") != "custom":
+        return ""
+    return _pose_ref.get(user_id, "")
+
+
+def prefs_line(user: dict, user_id: int | None = None) -> str:
     gender = GENDERS.get(str(user.get("gender")), GENDERS["f"])
+    look = LOOKS.get(str(user.get("look")), LOOKS["plain"])
     frame = FRAMES.get(str(user.get("frame")), FRAMES["full"])
+    if user.get("frame") == "custom" and user_id is not None and user_id not in _pose_ref:
+        frame = "Своя поза, фото не прислано"
     origin = ORIGINS.get(str(user.get("origin")), ORIGINS["ru"])
     interior = INTERIORS.get(str(user.get("interior")), INTERIORS["mirror"])
     shot = SHOTS.get(str(user.get("shot")), SHOTS["self"])
-    line = f"{gender}. {frame}. {shot}.\n{origin}. {interior}."
+    line = f"{gender}. {look}. {frame}. {shot}.\n{origin}. {interior}."
     if user.get("interior") == "street":
         season = SEASONS.get(str(user.get("season")), SEASONS["summer"])
         line += f" {season}."
@@ -370,12 +423,19 @@ def token_count(amount: int) -> str:
 
 DISCLAIMER = (
     "Генерация иногда ошибается: вещь, лицо или фон могут получиться неточно. "
-    "Вы генерируете на свой страх и риск. Мы улучшаем сервис."
+    "Вы генерируете на свой страх и риск. Мы стараемся улучшить сервис "
+    "и делаем всё возможное, чтобы вам было комфортно пользоваться ботом."
 )
 REF_TEXT = (
     "Так лучше снимать одежду для генерации.\n\n"
     "Фото желательно в хорошем качестве, чтобы детали были ярко и чётко видны. "
     "Иначе одежда на готовом изображении может отличаться от референса."
+)
+POSE_ASK = (
+    "Пришлите одно фото с нужной позой.\n\n"
+    "Модель возьмёт с него только положение тела: стойку, руки, ноги и ракурс. "
+    "Лицо, волосы, одежду и комнату с этого фото она не копирует. "
+    "Внешность и интерьер останутся из настроек."
 )
 
 
@@ -412,8 +472,9 @@ def clothes_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Пол", callback_data="pick:gender"),
-                InlineKeyboardButton(text="Поза", callback_data="pick:frame"),
+                InlineKeyboardButton(text="Образ", callback_data="pick:look"),
             ],
+            [InlineKeyboardButton(text="Поза", callback_data="pick:frame")],
             [
                 InlineKeyboardButton(text="Происхождение", callback_data="pick:origin"),
                 InlineKeyboardButton(text="Интерьер", callback_data="pick:interior"),
@@ -443,12 +504,21 @@ def back_kb() -> InlineKeyboardMarkup:
     )
 
 
+def pose_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back")]]
+    )
+
+
 def result_kb(mode: str) -> InlineKeyboardMarkup:
     if mode.startswith("place:"):
         repeat = mode
     else:
         repeat = {"tryon": "tryon"}.get(mode, "ready")
-    rows = [[InlineKeyboardButton(text="Ещё раз", callback_data=repeat)]]
+    rows = [
+        [InlineKeyboardButton(text="Ещё раз", callback_data=repeat)],
+        [InlineKeyboardButton(text="Перегенерировать", callback_data="regen")],
+    ]
     if mode != "clothes":
         rows.append([InlineKeyboardButton(text="Генерация по фото одежды", callback_data="clothes")])
     if mode == "clothes":
@@ -515,16 +585,20 @@ async def show_clothes(message: Message, user_id: int, *, edit: bool) -> None:
     user = await ensure_user(user_id)
     text = (
         "Настройте кадр и нажмите «К генерации».\n\n"
-        f"Сейчас: {prefs_line(user)}"
+        f"Сейчас: {prefs_line(user, user_id)}"
     )
     await show(message, text, clothes_kb(), edit=edit)
 
 
 async def show_ready(message: Message, user_id: int, *, edit: bool) -> None:
     user = await ensure_user(user_id)
+    pose_note = ""
+    if user.get("frame") == "custom" and user_id in _pose_ref:
+        pose_note = "Поза: ваше фото. Берём только стойку.\n"
     text = (
         "Настройки выбраны. Пришлите одно фото одежды.\n\n"
-        f"Сейчас: {prefs_line(user)}\n"
+        f"Сейчас: {prefs_line(user, user_id)}\n"
+        f"{pose_note}"
         f"Стоимость: {token_count(GENERATION_COST)}. На счёте: {token_count(user['balance'])}.\n\n"
         f"{DISCLAIMER}\n\n"
         "Лучше фото вещи на ровном фоне."
@@ -536,8 +610,8 @@ async def show_settings(message: Message, user_id: int, *, edit: bool) -> None:
     user = await ensure_user(user_id)
     text = (
         "Настройки генерации по фото одежды.\n\n"
-        f"Сейчас: {prefs_line(user)}\n\n"
-        "На примерку по своему фото пол, поза, съёмка, происхождение и интерьер не влияют: "
+        f"Сейчас: {prefs_line(user, user_id)}\n\n"
+        "На примерку по своему фото пол, образ, поза, съёмка, происхождение и интерьер не влияют: "
         "там сохраняются лицо, поза и фон снимка."
     )
     await show(message, text, clothes_kb(), edit=edit)
@@ -633,6 +707,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     if message.from_user:
+        _last_job.pop(message.from_user.id, None)
         await show_main(message, message.from_user.id, edit=False)
 
 
@@ -689,9 +764,18 @@ async def on_clothes(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ready")
 async def on_ready(query: CallbackQuery, state: FSMContext) -> None:
+    if query.message is None or query.from_user is None:
+        await query.answer()
+        return
+    user = await ensure_user(query.from_user.id)
+    if user.get("frame") == "custom" and query.from_user.id not in _pose_ref:
+        await state.update_data(pose_back="clothes")
+        await state.set_state(Flow.pose)
+        await show(query.message, POSE_ASK, pose_kb(), edit=True)
+        await query.answer()
+        return
     await state.set_state(Flow.garment)
-    if query.message and query.from_user:
-        await show_ready(query.message, query.from_user.id, edit=True)
+    await show_ready(query.message, query.from_user.id, edit=True)
     await query.answer()
 
 
@@ -861,6 +945,7 @@ async def on_settings(query: CallbackQuery, state: FSMContext) -> None:
 
 PICK_SCREENS: dict[str, tuple[str, dict[str, str], str]] = {
     "gender": ("Кто на фото?", GENDERS, "gender"),
+    "look": ("Какой образ?", LOOKS, "look"),
     "frame": ("Как поставить человека в кадре?", FRAMES, "frame"),
     "origin": ("Какое происхождение?", ORIGINS, "origin"),
     "interior": ("Где снять фото?", INTERIORS, "interior"),
@@ -895,7 +980,20 @@ async def on_set(query: CallbackQuery, state: FSMContext) -> None:
         await update_prefs(query.from_user.id, interior=key)
     elif kind == "gender":
         await update_prefs(query.from_user.id, gender=key)
+    elif kind == "look":
+        await update_prefs(query.from_user.id, look=key)
     elif kind == "frame":
+        if key == "custom":
+            if query.message is None:
+                await query.answer()
+                return
+            current = await state.get_state()
+            await state.update_data(pose_back="clothes" if current == Flow.garment.state else "settings")
+            await state.set_state(Flow.pose)
+            await show(query.message, POSE_ASK, pose_kb(), edit=True)
+            await query.answer()
+            return
+        _pose_ref.pop(query.from_user.id, None)
         await update_prefs(query.from_user.id, frame=key)
     elif kind == "shot":
         await update_prefs(query.from_user.id, shot=key)
@@ -914,7 +1012,15 @@ async def on_set(query: CallbackQuery, state: FSMContext) -> None:
 async def on_back(query: CallbackQuery, state: FSMContext) -> None:
     current = await state.get_state()
     if query.message:
-        if current == Flow.garment.state:
+        if current == Flow.pose.state:
+            data = await state.get_data()
+            if data.get("pose_back") == "clothes":
+                await state.set_state(Flow.garment)
+                await show_clothes(query.message, query.from_user.id, edit=True)
+            else:
+                await state.clear()
+                await show_settings(query.message, query.from_user.id, edit=True)
+        elif current == Flow.garment.state:
             await show_clothes(query.message, query.from_user.id, edit=True)
         else:
             await show_settings(query.message, query.from_user.id, edit=True)
@@ -930,18 +1036,51 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
         return
 
     current = await state.get_state()
+    if current == Flow.regen.state:
+        await message.answer("Напишите текстом, что исправить. Например: аккуратные волосы, цвет как на фото.")
+        return
     uri = await photo_to_data_uri(bot, message)
     if not uri:
         await message.answer("Не удалось прочитать фото. Пришлите изображение ещё раз.")
         return
 
+    if current == Flow.pose.state:
+        _pose_ref[message.from_user.id] = uri
+        await update_prefs(message.from_user.id, frame="custom")
+        data = await state.get_data()
+        await message.answer(
+            "Поза принята. С этого фото возьмётся только положение тела. "
+            "Лицо, волосы, одежду и комнату модель не копирует."
+        )
+        if data.get("pose_back") == "settings":
+            await state.clear()
+            await show_settings(message, message.from_user.id, edit=False)
+        else:
+            await state.set_state(Flow.garment)
+            await show_clothes(message, message.from_user.id, edit=False)
+        return
+
     if current == Flow.garment.state:
         user = await ensure_user(message.from_user.id)
-        prompt = prompt_for(user)
+        pose = pose_photo(message.from_user.id, user)
+        if user.get("frame") == "custom" and not pose:
+            await state.update_data(pose_back="clothes")
+            await state.set_state(Flow.pose)
+            await message.answer(POSE_ASK, reply_markup=pose_kb())
+            return
+        prompt = prompt_for(user, pose_photo=bool(pose))
         ratio = aspect_for(user)
 
+        _last_job[message.from_user.id] = {
+            "kind": "clothes",
+            "product": uri,
+            "prompt": prompt,
+            "aspect": ratio,
+            "pose": pose,
+        }
+
         async def job() -> bytes:
-            return await fashn.generate_from_garment(uri, prompt, ratio)
+            return await fashn.generate_from_garment(uri, prompt, ratio, pose)
 
         await run_generation(message, state, job, "clothes")
         return
@@ -951,6 +1090,12 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
         placement = data.get("placement")
         if placement not in PLACEMENTS:
             placement = "hanger"
+
+        _last_job[message.from_user.id] = {
+            "kind": "place",
+            "product": uri,
+            "placement": str(placement),
+        }
 
         async def hanger_job() -> bytes:
             return await fashn.generate_on_hanger(uri, str(placement))
@@ -972,6 +1117,12 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
             await message.answer("Сначала пришлите своё фото.", reply_markup=back_kb())
             return
 
+        _last_job[message.from_user.id] = {
+            "kind": "tryon",
+            "product": uri,
+            "person": person,
+        }
+
         async def job() -> bytes:
             return await fashn.generate_tryon(uri, person)
 
@@ -985,10 +1136,57 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
 @router.message(Flow.person, ~F.photo)
 @router.message(Flow.tryon_garment, ~F.photo)
 @router.message(Flow.hanger, ~F.photo)
+@router.message(Flow.pose, ~F.photo)
 async def not_photo(message: Message) -> None:
     if message.text and message.text.startswith("/"):
         return
     await message.answer("Пришлите изображение, не файл и не текст.")
+
+
+@router.callback_query(F.data == "regen")
+async def on_regen(query: CallbackQuery, state: FSMContext) -> None:
+    if query.from_user.id not in _last_job:
+        await query.answer("Сначала получите фото, потом его можно перегенерировать.", show_alert=True)
+        return
+    await state.set_state(Flow.regen)
+    if query.message:
+        await query.message.answer(
+            f"Перегенерация стоит {token_count(GENERATION_COST)}.\n\n"
+            "Напишите, что изменить. Комментарий добавится к запросу. "
+            "Исходное фото одежды и выбранная поза останутся теми же."
+        )
+    await query.answer()
+
+
+@router.message(Flow.regen, F.text)
+async def on_regen_text(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not message.text or message.text.startswith("/"):
+        return
+    note = " ".join(message.text.split())[:400]
+    if not note:
+        await message.answer("Напишите, что исправить.")
+        return
+    last = _last_job.get(message.from_user.id)
+    if not last:
+        await state.clear()
+        await message.answer("Исходное фото уже не сохранено. Пришлите его ещё раз.", reply_markup=main_kb())
+        return
+    kind = last.get("kind")
+
+    async def job() -> bytes:
+        if kind == "clothes":
+            prompt = f"{last['prompt']} User correction: {note}. Keep every other garment detail unchanged."
+            return await fashn.generate_from_garment(
+                str(last["product"]),
+                prompt,
+                str(last["aspect"]),
+                str(last.get("pose") or ""),
+            )
+        if kind == "tryon":
+            return await fashn.generate_tryon(str(last["product"]), str(last["person"]), note)
+        return await fashn.generate_on_hanger(str(last["product"]), str(last.get("placement") or "hanger"), note)
+
+    await run_generation(message, state, job, "clothes" if kind == "clothes" else "tryon" if kind == "tryon" else f"place:{last.get('placement') or 'hanger'}")
 
 
 @router.message(F.text)
