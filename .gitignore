@@ -1,7 +1,10 @@
-# Secrets
+# Secrets and local balances
 .env
 .env.*
 !.env.example
+balances.json
+*.json.tmp
+data/
 *.pem
 credentials.json
 secrets.json

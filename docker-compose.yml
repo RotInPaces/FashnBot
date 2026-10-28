@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      EXAMPLES_DIR: /app/examples
+    volumes:
+      - ./data:/data
+      - ./examples:/app/examples
+    restart: unless-stopped
