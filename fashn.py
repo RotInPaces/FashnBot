@@ -6,6 +6,7 @@ import asyncio
 import base64
 import logging
 import os
+import random
 from typing import Any
 
 import httpx
@@ -163,8 +164,10 @@ async def generate_from_garment(
     prompt: str,
     aspect_ratio: str = "2:3",
     pose_image: str = "",
+    background_image: str = "",
+    face_image: str = "",
 ) -> bytes:
-    """Фото вещи → новый человек. pose_image задаёт только стойку."""
+    """Фото вещи → новый человек. pose задаёт стойку, face — лицо, background — комнату."""
     inputs = {
         "product_image": product_image,
         "prompt": prompt,
@@ -173,40 +176,132 @@ async def generate_from_garment(
     }
     if pose_image:
         inputs["image_prompt"] = pose_image
+    if background_image:
+        inputs["background_reference"] = background_image
+    if face_image:
+        inputs["face_reference"] = face_image
+        inputs["face_reference_mode"] = "match_base"
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
         return await _run(client, inputs, "product-to-model")
 
 
+_KEEP = (
+    "No person, no mannequin. Preserve the exact color, print, fabric, seams, pockets, "
+    "buttons, zippers and length. Do not redesign the garment and do not invent details."
+)
+_HANGER_SCENES = (
+    "a white hanger on a slim white clothing rail standing against the wall",
+    "a matte black hanger on a slim white clothing rail standing against the wall",
+    "a matte black hanger on a slim black clothing rail standing against the wall",
+    "a light wood hanger on the open door of a pale wardrobe",
+)
 _PACKSHOT_PROMPTS = {
-    "hanger": (
-        "garment hanging on a simple wooden hanger, front view, natural drape, "
-        "light neutral wall, soft daylight, catalog photo, no person, no mannequin, "
-        "preserve the exact color, print, seams, pockets and length, do not redesign the garment"
+    "rail": (
+        "Match the reference scene: the same rail, hangers, wall, floor, light and spacing. "
+        "Hang only the user's garment, full length, front view, natural drape, as the clear hero. "
+        "Replace the clothes from the reference. Do not copy the other garments. "
+        f"{_KEEP}"
     ),
     "bed": (
-        "garment laid neatly on a made bed with simple light linen, soft daylight, "
-        "lifestyle marketplace photo, no person, preserve the exact color, print, seams, pockets and length, "
-        "do not redesign the garment"
+        "Garment laid neatly on a made bed with simple light linen, soft daylight, "
+        f"lifestyle marketplace photo. {_KEEP}"
+    ),
+    "white": (
+        "Lay the garment flat on a seamless pure white background, straight overhead catalog shot, "
+        "even soft light, only a faint soft shadow under the garment. "
+        "No floorboards, no wall, no room, no horizon line, no props. "
+        f"{_KEEP}"
     ),
     "floor": (
-        "garment laid flat on a clean light floor, slight top-down angle, soft daylight, "
-        "marketplace photo, no person, preserve the exact color, print, seams, pockets and length, "
-        "do not redesign the garment"
+        "Lay the user's garment flat on the floor from the reference: light wood laminate with visible boards, "
+        "soft daylight, a slight top-down angle so the surface reads as a real floor, not a white wall. "
+        "Use the reference for the floor, the light and the angle only. Do not copy the garment in the reference. "
+        f"{_KEEP}"
     ),
 }
 
 
-async def generate_on_hanger(product_image: str, placement: str = "hanger", note: str = "") -> bytes:
-    """Фото вещи → кадр без человека: вешалка, кровать или пол."""
-    prompt = _PACKSHOT_PROMPTS.get(placement, _PACKSHOT_PROMPTS["hanger"])
+def _stand_prompt() -> str:
+    hanger = random.choice(("wooden hanger", "slim metal hanger"))
+    scene = random.choice((
+        "bright minimalist home dressing corner",
+        "small boutique corner",
+        "bedroom by the window",
+    ))
+    surface = random.choice((
+        "light plaster wall",
+        "light oak floor",
+        "beige wall with a baseboard",
+    ))
+    rack = random.choice(("matte white", "black metal", "light wood"))
+    extra_garment = random.choice((
+        "",
+        " One more garment hangs on the rack, partly visible and out of focus.",
+    ))
+    side = random.choice(("left", "right"))
+    lens = random.choice(("35mm", "50mm"))
+    angle = random.choice(("straight-on", "5 degree off-axis"))
+    props = ("plant", "shoe", "bag", "chair")
+    first = random.choice(props)
+    second = random.choice(tuple(item for item in props if item != first))
+    return (
+        "Use the attached photo as the exact product reference. "
+        "Create a realistic photograph of this exact garment hanging on a "
+        f"{hanger} on a freestanding floor clothing rack, as if shot by a person "
+        "on a smartphone or mirrorless camera for a marketplace listing. "
+        f"Scene: {scene} with {surface}. The rack is {rack}.{extra_garment} "
+        f"Light: soft natural daylight from a large window on the {side}, plus gentle "
+        "bounce light from the walls so the shadows stay light and the scene does not feel empty. "
+        "Soft window shadow on the wall with natural falloff. Realistic soft contact shadow of the garment on the wall. "
+        "Color temperature neutral to slightly warm, accurate white balance. "
+        f"Camera: shot on a {lens} lens, f/2.8 to f/4, eye level, slight {angle} angle, "
+        "vertical 3:4 frame, garment fully visible with some air around it. "
+        "Tiny natural film or sensor grain, very slight vignette, no HDR look. "
+        "Realism details: natural fabric folds and gravity-correct drape, small soft wrinkles on sleeves and hem, "
+        "visible fabric texture, slightly uneven light across the wall, "
+        f"a couple of real-life objects out of focus in the background, a {first} and a {second}, not staged perfectly. "
+        "Preserve exactly: garment color, cut, proportions, hood shape, zipper and zipper pull, pockets, "
+        "cuffs and hem elastic, stitching, seams, any print or label. Do not redesign or recolor the item. "
+        "Keep the color true to the reference. "
+        "Avoid: CGI or 3D render look, plastic or overly smooth fabric, glossy airbrushed look, perfect symmetry, "
+        "floating hanger, hanger hook not touching the bar, warped rack, extra fingers or people, random text, "
+        "logos, watermarks, harsh HDR, oversaturated colors, empty flat gray background."
+    )
+
+
+async def generate_on_hanger(
+    product_image: str,
+    placement: str = "hanger",
+    note: str = "",
+    context_image: str = "",
+) -> bytes:
+    """Фото вещи → кадр без человека: вешалка, рейл, стойка, кровать или пол."""
+    if placement == "stand":
+        prompt = _stand_prompt()
+    elif placement == "hanger":
+        scene = random.choice(_HANGER_SCENES)
+        prompt = (
+            "Lifestyle marketplace photo in a cozy bright room, as if the garment was just taken "
+            "from the wardrobe to try on. "
+            f"It hangs on {scene}. "
+            "Laconic interior: pale walls, soft window daylight, light floor, almost no furniture, "
+            "no clutter, no text, no logos, no shopping bags, no other clothes. "
+            "Front view, the whole garment in frame with space around it, natural drape, the garment is the hero. "
+            "The rail or wardrobe is complete and stands naturally. "
+            f"{_KEEP}"
+        )
+    else:
+        prompt = _PACKSHOT_PROMPTS.get(placement, _PACKSHOT_PROMPTS["bed"])
     if note:
         prompt += f" User correction: {note}. Keep every other garment detail unchanged."
     inputs = {
         "product_image": product_image,
         "prompt": prompt,
-        "aspect_ratio": "3:4",
+        "aspect_ratio": "4:5" if placement == "rail" else "3:4",
         **_FIDELITY,
     }
+    if context_image:
+        inputs["image_context"] = context_image
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
         return await _run(client, inputs, "packshot")
 

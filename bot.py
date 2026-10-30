@@ -7,6 +7,8 @@ import base64
 import json
 import logging
 import os
+import random
+import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -53,10 +55,9 @@ def _examples_dir() -> Path:
 
 BALANCES_PATH = _balances_path()
 EXAMPLES_DIR = _examples_dir()
-EXAMPLE_NAMES = ("before-1", "after-1", "before-2", "after-2")
 EXAMPLE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 _balance_lock = asyncio.Lock()
-_busy: set[int] = set()
+_jobs: dict[str, dict] = {}
 
 ORIGINS: dict[str, str] = {
     "ru": "Русская",
@@ -153,8 +154,57 @@ SHOT_PROMPTS: dict[str, str] = {
 }
 PLACEMENTS: dict[str, str] = {
     "hanger": "На вешалке",
+    "rail": "На рейле",
+    "stand": "На напольной вешалке",
     "bed": "На кровати",
+    "white": "На белом фоне",
     "floor": "На полу",
+}
+PACKSHOT_REFS: dict[str, str] = {
+    "rail": "rail",
+    "floor": "floor",
+}
+SET_SIZE = 5
+SET3_VIEWS: tuple[str, ...] = (
+    "full-body front view, facing the camera, arms relaxed, the whole garment visible",
+    "full-body back view, standing straight, the whole garment visible from behind",
+    "full-body strict left profile, body and face turned 90 degrees, looking perpendicular to the camera, not at the camera, garment fully visible from the left side",
+    "full-body strict right profile, body and face turned 90 degrees, looking perpendicular to the camera, not at the camera, garment fully visible from the right side",
+    "full-body three-quarter diagonal view, garment visible from the front and one side",
+)
+SET_POSES: tuple[str, ...] = (
+    "full-body front view, standing naturally, arms relaxed, looking at the camera, clothes fully visible",
+    "full-body three-quarter view, looking toward the camera, clothes fully visible",
+    "full-body side view, same garment visible from the side, looking toward the camera",
+    "casual mid-step walk, clothes fully visible, natural arms",
+    "relaxed full-body stance, weight on one leg, clothes fully visible, looking at the camera",
+)
+SETS: dict[str, dict[str, str]] = {
+    "1": {
+        "title": "Сет №1",
+        "scene": "studio",
+        "about": "Белая студия.",
+    },
+    "2": {
+        "title": "Сет №2",
+        "scene": "interior",
+        "about": "Интерьер из настроек.",
+    },
+    "3": {
+        "title": "Сет №3",
+        "scene": "white",
+        "about": "Одежда со всех сторон на белом фоне.",
+    },
+    "4": {
+        "title": "Сет №4",
+        "scene": "locked",
+        "about": "",
+    },
+    "5": {
+        "title": "Сет №5",
+        "scene": "locked",
+        "about": "",
+    },
 }
 
 
@@ -165,15 +215,26 @@ class Flow(StatesGroup):
     hanger = State()
     regen = State()
     pose = State()
+    photoset = State()
+    extra = State()
 
 
 _last_job: dict[int, dict] = {}
+
+
+def remember_job(user_id: int, payload: dict) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    _jobs[job_id] = payload
+    _last_job[user_id] = payload
+    while len(_jobs) > 100:
+        _jobs.pop(next(iter(_jobs)))
+    return job_id
 # Своя поза: data URI только в памяти, на диск не пишем.
 _pose_ref: dict[int, str] = {}
 
 
-# Рубли и кредиты. Подставляются в QR, когда появится банк.
-PACKAGES: tuple[tuple[int, int], ...] = ((100, 10), (300, 35), (500, 60))
+# Рубли и токены: 25 ₽ за токен. В кнопке старая цена — 120% от этой.
+PACKAGES: tuple[tuple[int, int], ...] = ((250, 10), (875, 35), (1500, 60), (2500, 100))
 
 
 def _required(name: str) -> str:
@@ -215,6 +276,29 @@ def _admin_ids() -> set[int]:
 
 
 ADMIN_IDS = _admin_ids()
+
+
+def _support_id() -> int:
+    raw = os.getenv("SUPPORT_ID", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise SystemExit("SUPPORT_ID должен быть числовым Telegram ID") from exc
+        if value < 1:
+            raise SystemExit("SUPPORT_ID должен быть числовым Telegram ID")
+        return value
+    for part in os.getenv("ADMIN_IDS", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        return int(part)
+    return 0
+
+
+SUPPORT_ID = _support_id()
+PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti-10-30-73"
+TERMS_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-10-30-40"
 router = Router()
 
 
@@ -247,6 +331,7 @@ def _blank_user(balance: int) -> dict:
         "shot": "self",
         "season": "summer",
         "look": "plain",
+        "extra": "",
     }
 
 
@@ -268,6 +353,7 @@ async def ensure_user(user_id: int) -> dict:
             "shot": "self",
             "season": "summer",
             "look": "plain",
+            "extra": "",
         }
         for field, default in defaults.items():
             if field not in user:
@@ -288,6 +374,7 @@ async def update_prefs(
     shot: str | None = None,
     season: str | None = None,
     look: str | None = None,
+    extra: str | None = None,
 ) -> dict:
     async with _balance_lock:
         data = _load_balances()
@@ -309,12 +396,28 @@ async def update_prefs(
             user["season"] = season
         if look in LOOKS:
             user["look"] = look
+        if extra is not None:
+            user["extra"] = " ".join(extra.split())[:300]
         data[key] = user
         _save_balances(data)
         return dict(user)
 
 
-async def spend(user_id: int) -> int | None:
+def photoset_cost() -> int:
+    return SET_SIZE * GENERATION_COST
+
+
+FACE_LOCK_EXTRA = 15
+
+
+def set_price(face_lock: bool, made: int | None = None) -> int:
+    count = SET_SIZE if made is None else made
+    extra = FACE_LOCK_EXTRA * count // SET_SIZE if face_lock else 0
+    return count * GENERATION_COST + extra
+
+
+async def spend(user_id: int, amount: int | None = None) -> int | None:
+    cost = GENERATION_COST if amount is None else amount
     async with _balance_lock:
         data = _load_balances()
         key = str(user_id)
@@ -322,9 +425,9 @@ async def spend(user_id: int) -> int | None:
         if not isinstance(user, dict):
             return None
         balance = int(user.get("balance", 0))
-        if balance < GENERATION_COST:
+        if cost < 1 or balance < cost:
             return None
-        user["balance"] = balance - GENERATION_COST
+        user["balance"] = balance - cost
         data[key] = user
         _save_balances(data)
         return int(user["balance"])
@@ -360,13 +463,16 @@ def appearance_prompt(user: dict) -> str:
     return styling + ", not tired, not exhausted, no messy or unkempt hair"
 
 
+POSE_REFERENCE = (
+    "Match only the body pose from the pose reference: stance, arms, legs, head angle and crop. "
+    "Do not copy that reference person's face, hair, identity, clothes, colors, lighting or room"
+)
+
+
 def prompt_for(user: dict, *, pose_photo: bool = False) -> str:
     interior = INTERIOR_PROMPTS.get(str(user.get("interior")), INTERIOR_PROMPTS["mirror"])
     if pose_photo:
-        frame = (
-            "Match only the body pose from the pose reference: stance, arms, legs, head angle and crop. "
-            "Do not copy that reference person's face, hair, identity, clothes, colors, lighting or room"
-        )
+        frame = POSE_REFERENCE
     else:
         frame = FRAME_PROMPTS.get(str(user.get("frame")), FRAME_PROMPTS["full"])
     shot = SHOT_PROMPTS.get(str(user.get("shot")), SHOT_PROMPTS["self"])
@@ -381,11 +487,133 @@ def prompt_for(user: dict, *, pose_photo: bool = False) -> str:
         "Do not add, remove or recolor any detail. Do not invent another jacket or an extra layer. "
         f"The person is {appearance_prompt(user)}. "
         f"{frame}. {interior}, {season}{shot}."
+        f"{extra_clause(user)}"
     )
 
 
 def aspect_for(user: dict) -> str:
     return FRAME_RATIOS.get(str(user.get("frame")), FRAME_RATIOS["full"])
+
+
+def set_folder(set_id: str) -> Path:
+    return EXAMPLES_DIR / "sets" / f"set-{set_id}"
+
+
+def find_example(folder: Path, name: str) -> Path | None:
+    for suffix in EXAMPLE_SUFFIXES:
+        path = folder / f"{name}{suffix}"
+        if path.is_file():
+            return path
+    return None
+
+
+def packshot_context(placement: str) -> str:
+    name = PACKSHOT_REFS.get(placement)
+    if not name:
+        return ""
+    path = find_example(EXAMPLES_DIR, name)
+    if path is None:
+        return ""
+    return file_data_uri(path)
+
+
+def choose_pose_files(set_id: str) -> list[Path | None]:
+    """Сеты 1, 2 и 4 берут poses/1…5. Сет 3 без образцов. Сет 5 выбирает 5 случайных."""
+    if set_id == "3":
+        return [None] * SET_SIZE
+    folder = set_folder(set_id) / "poses"
+    if set_id == "5":
+        found = [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in EXAMPLE_SUFFIXES
+        ] if folder.is_dir() else []
+        if len(found) > SET_SIZE:
+            found = random.sample(found, SET_SIZE)
+        else:
+            found.sort(key=lambda path: path.name)
+        slots: list[Path | None] = list(found)
+        while len(slots) < SET_SIZE:
+            slots.append(None)
+        return slots
+    return [find_example(folder, str(number)) for number in range(1, SET_SIZE + 1)]
+
+
+def file_data_uri(path: Path) -> str:
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(path.suffix.lower(), "image/jpeg")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def set_heading(set_id: str) -> str:
+    info = SETS[set_id]
+    if info["about"]:
+        return f"{info['title']}. {info['about']}"
+    return info["title"]
+
+
+def photoset_prompt(user: dict, set_id: str, index: int, *, has_room: bool, has_pose: bool, has_model: bool) -> str:
+    info = SETS[set_id]
+    if set_id == "3":
+        pose = SET3_VIEWS[index]
+        scene = "on a seamless pure white background, even soft light, no furniture, no room"
+        shot = "clean catalog photo, not a mirror selfie"
+        mood = " Calm face, not sad, not frowning, not tired."
+        extra = (
+            " On the back and side views continue the same garment. "
+            "Do not invent prints, pockets, seams, logos, buttons or an extra layer that are not in the product photo."
+        )
+    else:
+        pose = POSE_REFERENCE if has_pose else SET_POSES[index]
+        mood = ""
+        extra = ""
+        if info["scene"] == "studio":
+            scene = "in a plain white seamless photo studio, even soft light, no furniture"
+            shot = "clean studio catalog photo, not a mirror selfie"
+        elif info["scene"] == "interior":
+            scene = INTERIOR_PROMPTS.get(str(user.get("interior")), INTERIOR_PROMPTS["mirror"])
+            shot = SHOT_PROMPTS.get(str(user.get("shot")), SHOT_PROMPTS["self"])
+            if user.get("shot", "self") == "self" and user.get("interior") != "mirror":
+                shot = "casual smartphone photo, realistic product review photo"
+            if user.get("interior") == "street":
+                season = SEASON_PROMPTS.get(str(user.get("season")), SEASON_PROMPTS["summer"])
+                scene = f"{scene}, {season}"
+        else:
+            scene = "in one consistent place for the whole photoshoot"
+            shot = "natural clothing photo from the same photoshoot"
+    room = ""
+    if has_room and set_id != "3":
+        room = " Keep the same room as the background reference. Do not change the location or furniture."
+    identity = ""
+    if has_model:
+        identity = (
+            " The face reference is this exact person: keep the same face and hair. "
+            "Do not copy that photo's clothes, pose or background."
+        )
+    return (
+        "Copy the garment from the product photo exactly: same color, print, fabric, "
+        "stitching, pockets, buttons, zippers, logos, length and shape. "
+        "Do not add, remove or recolor any detail. Do not invent another jacket or an extra layer. "
+        f"{extra}"
+        f"The person is {appearance_prompt(user)}.{mood}{identity} "
+        f"{pose}. {scene}, {shot}.{room}"
+        f"{extra_clause(user)}"
+    )
+
+
+def confirm_text(heading: str, detail: str, balance: int, cost: int, ask: str = "Пришлите одно фото одежды.") -> str:
+    return (
+        f"{heading}\n\n"
+        f"Сейчас: {detail}\n"
+        f"Стоимость: {token_count(cost)}. На счёте: {token_count(balance)}.\n\n"
+        f"{DISCLAIMER}\n\n"
+        f"{ask}"
+    )
 
 
 def pose_photo(user_id: int, user: dict) -> str:
@@ -407,7 +635,24 @@ def prefs_line(user: dict, user_id: int | None = None) -> str:
     if user.get("interior") == "street":
         season = SEASONS.get(str(user.get("season")), SEASONS["summer"])
         line += f" {season}."
+    line += f"\n{extra_line(user)}"
     return line
+
+
+def user_extra(user: dict) -> str:
+    return " ".join(str(user.get("extra") or "").split())[:300]
+
+
+def extra_line(user: dict) -> str:
+    text = user_extra(user)
+    return f"Свой промпт: {text if text else 'нет'}"
+
+
+def extra_clause(user: dict) -> str:
+    text = user_extra(user)
+    if not text:
+        return ""
+    return f" Additional request: {text}."
 
 
 def token_count(amount: int) -> str:
@@ -441,9 +686,10 @@ POSE_ASK = (
 
 def main_text(user: dict) -> str:
     return (
-        "Бот собирает фото одежды для карточек маркетплейса и отзывов.\n\n"
-        "Можно сгенерировать человека в вашей вещи, примерить её на своё фото "
-        "или снять саму вещь на вешалке, кровати или полу.\n\n"
+        "Бот собирает фото одежды для маркетплейса и примерки вещей, "
+        "как они будут смотреться на модели.\n\n"
+        "Можно сгенерировать человека в вашей вещи, собрать фотосет из пяти кадров, "
+        "примерить вещь на своё фото или снять её на вешалке, рейле, кровати, белом фоне или полу.\n\n"
         "По умолчанию это обычная русская девушка, которая купила вещь "
         "и сняла себя в зеркале.\n\n"
         f"{DISCLAIMER}\n\n"
@@ -463,8 +709,17 @@ def main_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Пополнить", callback_data="topup"),
             ],
             [InlineKeyboardButton(text="Настройки", callback_data="settings")],
+            [InlineKeyboardButton(text="Политика конфиденциальности", url=PRIVACY_URL)],
+            [InlineKeyboardButton(text="Пользовательское соглашение", url=TERMS_URL)],
+            *support_row(),
         ]
     )
+
+
+def support_row() -> list[list[InlineKeyboardButton]]:
+    if SUPPORT_ID < 1:
+        return []
+    return [[InlineKeyboardButton(text="Обращение в тех.поддержку", url=f"tg://user?id={SUPPORT_ID}")]]
 
 
 def clothes_kb() -> InlineKeyboardMarkup:
@@ -483,7 +738,9 @@ def clothes_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Съёмка", callback_data="pick:shot"),
                 InlineKeyboardButton(text="Сезон", callback_data="pick:season"),
             ],
+            [InlineKeyboardButton(text="Добавить детали к запросу", callback_data="extra")],
             [InlineKeyboardButton(text="К генерации", callback_data="ready")],
+            [InlineKeyboardButton(text="Фотосет из 5 фото", callback_data="photosets")],
             [InlineKeyboardButton(text="В меню", callback_data="menu")],
         ]
     )
@@ -504,20 +761,28 @@ def back_kb() -> InlineKeyboardMarkup:
     )
 
 
+def extra_kb(has_text: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_text:
+        rows.append([InlineKeyboardButton(text="Убрать свой промпт", callback_data="extra_clear")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def pose_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back")]]
     )
 
 
-def result_kb(mode: str) -> InlineKeyboardMarkup:
-    if mode.startswith("place:"):
+def result_kb(mode: str, job_id: str = "") -> InlineKeyboardMarkup:
+    if mode.startswith("place:") or mode.startswith("pmake:"):
         repeat = mode
     else:
         repeat = {"tryon": "tryon"}.get(mode, "ready")
     rows = [
         [InlineKeyboardButton(text="Ещё раз", callback_data=repeat)],
-        [InlineKeyboardButton(text="Перегенерировать", callback_data="regen")],
+        [InlineKeyboardButton(text="Перегенерировать", callback_data=f"regen:{job_id}" if job_id else "regen")],
     ]
     if mode != "clothes":
         rows.append([InlineKeyboardButton(text="Генерация по фото одежды", callback_data="clothes")])
@@ -528,9 +793,18 @@ def result_kb(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def package_label(rubles: int, credits: int) -> str:
+    return f"🔥 {rubles} ₽ — {token_count(credits)} 💎 🔥"
+
+
+def package_html(rubles: int, credits: int) -> str:
+    shown = rubles * 6 // 5
+    return f"🔥 <s>{shown}</s> {rubles} ₽ — {token_count(credits)} 💎 🔥"
+
+
 def topup_kb() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"{rubles} ₽ — {token_count(credits)}", callback_data=f"pay:{rubles}")]
+        [InlineKeyboardButton(text=package_label(rubles, credits), callback_data=f"pay:{rubles}")]
         for rubles, credits in PACKAGES
     ]
     rows.append([InlineKeyboardButton(text="Назад", callback_data="menu")])
@@ -568,16 +842,34 @@ def ready_kb() -> InlineKeyboardMarkup:
     )
 
 
+def _named_example(name: str) -> Path | None:
+    return next(
+        (
+            EXAMPLES_DIR / f"{name}{suffix}"
+            for suffix in EXAMPLE_SUFFIXES
+            if (EXAMPLES_DIR / f"{name}{suffix}").is_file()
+        ),
+        None,
+    )
+
+
 def example_files() -> list[Path] | None:
     found: list[Path] = []
-    for name in EXAMPLE_NAMES:
-        match = next(
-            (EXAMPLES_DIR / f"{name}{suffix}" for suffix in EXAMPLE_SUFFIXES if (EXAMPLES_DIR / f"{name}{suffix}").is_file()),
-            None,
-        )
-        if match is None:
-            return None
-        found.append(match)
+    number = 1
+    while True:
+        before = _named_example(f"before-{number}")
+        if before is None:
+            break
+        after = _named_example(f"after-{number}")
+        if after is None and number == 4:
+            after = _named_example("after-5")
+        if after is None:
+            break
+        found.append(before)
+        found.append(after)
+        number += 1
+    if len(found) < 2:
+        return None
     return found
 
 
@@ -596,12 +888,12 @@ async def show_ready(message: Message, user_id: int, *, edit: bool) -> None:
     if user.get("frame") == "custom" and user_id in _pose_ref:
         pose_note = "Поза: ваше фото. Берём только стойку.\n"
     text = (
-        "Настройки выбраны. Пришлите одно фото одежды.\n\n"
+        "Настройки выбраны.\n\n"
         f"Сейчас: {prefs_line(user, user_id)}\n"
         f"{pose_note}"
         f"Стоимость: {token_count(GENERATION_COST)}. На счёте: {token_count(user['balance'])}.\n\n"
         f"{DISCLAIMER}\n\n"
-        "Лучше фото вещи на ровном фоне."
+        "Пришлите одно фото одежды. Лучше на ровном фоне."
     )
     await show(message, text, ready_kb(), edit=edit)
 
@@ -630,81 +922,310 @@ async def photo_to_data_uri(bot: Bot, message: Message) -> str | None:
     return f"data:image/jpeg;base64,{encoded}"
 
 
-async def run_generation(message: Message, state: FSMContext, job, mode: str) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-    if user_id in _busy:
-        await message.answer("Предыдущая генерация ещё идёт. Дождитесь результата.")
-        return
+async def _clear_if_same(state: FSMContext, started: str | None, token: str) -> None:
+    if await state.get_state() == started and (await state.get_data()).get("run_token") == token:
+        await state.clear()
 
+
+async def run_generation(message: Message, state: FSMContext, job, mode: str, pending: dict | None = None) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    started = await state.get_state()
+    token = uuid.uuid4().hex
+    await state.update_data(run_token=token)
     user = await ensure_user(user_id)
     if int(user["balance"]) < GENERATION_COST:
         await message.answer(
             f"Недостаточно токенов. Нужно {token_count(GENERATION_COST)}, на счёте {token_count(user['balance'])}.",
             reply_markup=main_kb(),
         )
-        await state.clear()
+        await _clear_if_same(state, started, token)
         return
 
-    _busy.add(user_id)
+    balance = await spend(user_id)
+    if balance is None:
+        await message.answer(
+            f"Недостаточно токенов. Нужно {token_count(GENERATION_COST)}, на счёте {token_count(int(user['balance']))}.",
+            reply_markup=main_kb(),
+        )
+        await _clear_if_same(state, started, token)
+        return
+
+    job_id = remember_job(user_id, pending) if pending else ""
+    status = await message.answer("Генерирую фото. Обычно это занимает до минуты.")
     try:
-        status = await message.answer("Генерирую фото. Обычно это занимает до минуты.")
-        try:
-            image = await job()
-        except fashn.FashnError as exc:
-            logger.error("Generation failed: %s", exc.name)
-            await status.edit_text(fashn.user_message(exc))
-            await message.answer("Токены не списаны.", reply_markup=main_kb())
-            await state.clear()
-            return
-        except Exception:
-            logger.exception("Generation crashed")
-            await status.edit_text("Не получилось сгенерировать фото. Попробуйте ещё раз.")
-            await message.answer("Токены не списаны.", reply_markup=main_kb())
-            await state.clear()
+        image = await job()
+    except fashn.FashnError as exc:
+        logger.error("Generation failed: %s", exc.name)
+        returned = await add_credits(user_id, GENERATION_COST)
+        await status.edit_text(fashn.user_message(exc))
+        await message.answer(f"Токены не списаны. На счёте: {token_count(returned)}.", reply_markup=main_kb())
+        await _clear_if_same(state, started, token)
+        return
+    except Exception:
+        logger.exception("Generation crashed")
+        returned = await add_credits(user_id, GENERATION_COST)
+        await status.edit_text("Не получилось сгенерировать фото. Попробуйте ещё раз.")
+        await message.answer(f"Токены не списаны. На счёте: {token_count(returned)}.", reply_markup=main_kb())
+        await _clear_if_same(state, started, token)
+        return
+
+    if not image:
+        returned = await add_credits(user_id, GENERATION_COST)
+        await status.edit_text("Сервис не вернул изображение.")
+        await message.answer(f"Токены не списаны. На счёте: {token_count(returned)}.", reply_markup=main_kb())
+        await _clear_if_same(state, started, token)
+        return
+
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+    try:
+        await message.answer_photo(
+            BufferedInputFile(image, filename="result.png"),
+            caption="Готово.",
+        )
+        fresh = await ensure_user(user_id)
+        await message.answer(
+            f"На счёте: {token_count(fresh['balance'])}.\nОдна генерация — {token_count(GENERATION_COST)}.",
+            reply_markup=result_kb(mode, job_id),
+        )
+    except Exception:
+        logger.exception("Failed to send generated photo")
+        returned = await add_credits(user_id, GENERATION_COST)
+        await message.answer(
+            f"Не удалось отправить фото. Токены возвращены. На счёте: {token_count(returned)}.",
+            reply_markup=main_kb(),
+        )
+    await _clear_if_same(state, started, token)
+
+
+def sets_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=info["title"], callback_data=f"pset:{set_id}")]
+        for set_id, info in SETS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="clothes")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def make_set_kb(set_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Сгенерировать этот сет", callback_data=f"pmake:{set_id}")],
+            [InlineKeyboardButton(text="С сохранением лица (+15 токенов)", callback_data=f"pmake:{set_id}:face")],
+            [InlineKeyboardButton(text="К списку сетов", callback_data="photosets")],
+        ]
+    )
+
+
+async def show_sets(message: Message, user_id: int, *, edit: bool) -> None:
+    user = await ensure_user(user_id)
+    text = (
+        "Фотосет — 5 кадров в вашей одежде.\n\n"
+        "Сет №1 — белая студия.\n"
+        "Сет №2 — интерьер из настроек.\n"
+        "Сет №3 — одежда со всех сторон на белом фоне.\n"
+        "Сет №4.\n"
+        "Сет №5.\n"
+        "В сетах №1, №2 и №4 стойка берётся из образцов поз. "
+        "В сете №5 пять поз выбираются случайно.\n"
+        "Сохранение лица на всех кадрах включается отдельно, это плюс 15 токенов.\n\n"
+        f"Сет стоит {token_count(photoset_cost())}. На счёте: {token_count(user['balance'])}."
+    )
+    await show(message, text, sets_kb(), edit=edit)
+
+
+async def send_set_examples(message: Message, set_id: str) -> None:
+    folder = set_folder(set_id)
+    files = [find_example(folder, str(number)) for number in range(1, SET_SIZE + 1)]
+    found = [path for path in files if path is not None]
+    caption = (
+        f"{set_heading(set_id)}\n\n"
+        "Готовый результат может немного отличаться от примеров."
+    )
+    if not found:
+        return
+    if len(found) == 1:
+        await message.answer_photo(FSInputFile(found[0]), caption=caption)
+        return
+    media = [
+        InputMediaPhoto(media=FSInputFile(path), caption=caption if index == 0 else None)
+        for index, path in enumerate(found)
+    ]
+    await message.answer_media_group(media)
+
+
+async def run_photoset(
+    message: Message,
+    state: FSMContext,
+    product_uri: str,
+    set_id: str,
+    note: str = "",
+    face_lock: bool = False,
+) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    if set_id not in SETS:
+        await message.answer("Выберите сет кнопкой.", reply_markup=sets_kb())
+        return
+    user = await ensure_user(user_id)
+    cost = set_price(face_lock)
+    if int(user["balance"]) < cost:
+        await message.answer(
+            f"Недостаточно токенов. Сет стоит {token_count(cost)}, на счёте {token_count(user['balance'])}.",
+            reply_markup=main_kb(),
+        )
+        return
+
+    started = await state.get_state()
+    token = uuid.uuid4().hex
+    await state.update_data(run_token=token)
+    balance = await spend(user_id, cost)
+    if balance is None:
+        await message.answer(
+            f"Недостаточно токенов. Сет стоит {token_count(cost)}, на счёте {token_count(int(user['balance']))}.",
+            reply_markup=main_kb(),
+        )
+        await _clear_if_same(state, started, token)
+        return
+
+    folder = set_folder(set_id)
+    pose_files = choose_pose_files(set_id)
+    room_file = None if SETS[set_id]["scene"] in {"interior", "white"} else find_example(folder, "room")
+    room_uri = file_data_uri(room_file) if room_file is not None else ""
+
+    images: list[bytes] = []
+    locked_room = room_uri
+    face_uri = ""
+    error_text = ""
+    try:
+        status = await message.answer(f"Генерирую фото 1 из {SET_SIZE}.")
+        for index in range(SET_SIZE):
+            if index:
+                try:
+                    await status.edit_text(f"Генерирую фото {index + 1} из {SET_SIZE}.")
+                except TelegramBadRequest:
+                    pass
+            pose_file = pose_files[index]
+            logger.info(
+                "Photoset %s frame %s pose %s model %s",
+                set_id,
+                index + 1,
+                pose_file.name if pose_file is not None else "none",
+                "face" if face_uri else "none",
+            )
+            prompt = photoset_prompt(
+                user,
+                set_id,
+                index,
+                has_room=bool(locked_room),
+                has_pose=pose_file is not None,
+                has_model=bool(face_uri),
+            )
+            if note:
+                prompt += f" User correction: {note}. Keep every other garment detail unchanged."
+            try:
+                image = await fashn.generate_from_garment(
+                    product_uri,
+                    prompt,
+                    "2:3",
+                    file_data_uri(pose_file) if pose_file is not None else "",
+                    locked_room,
+                    face_uri,
+                )
+            except fashn.FashnError as exc:
+                logger.error("Photoset failed on frame %s: %s", index + 1, exc.name)
+                error_text = fashn.user_message(exc)
+                break
+            except Exception:
+                logger.exception("Photoset crashed")
+                error_text = "Не получилось сгенерировать фото. Попробуйте ещё раз."
+                break
+            images.append(image)
+            if face_lock and index == 0:
+                encoded = base64.b64encode(image).decode("ascii")
+                face_uri = f"data:image/png;base64,{encoded}"
+
+        if not images:
+            returned = await add_credits(user_id, cost)
+            await status.edit_text(error_text or "Не получилось сгенерировать фото. Попробуйте ещё раз.")
+            await message.answer(f"Токены не списаны. На счёте: {token_count(returned)}.", reply_markup=main_kb())
+            await _clear_if_same(state, started, token)
             return
 
-        if not image:
-            await status.edit_text("Сервис не вернул изображение.")
-            await message.answer("Токены не списаны.", reply_markup=main_kb())
-            await state.clear()
-            return
-
-        balance = await spend(user_id)
-        if balance is None:
-            await status.edit_text("Баланс закончился во время генерации. Результат не отправляю.")
-            await state.clear()
-            return
-
+        made = len(images)
+        charged = set_price(face_lock, made)
+        if charged < cost:
+            balance = await add_credits(user_id, cost - charged)
+        job_id = remember_job(
+            user_id,
+            {
+                "kind": "photoset",
+                "product": product_uri,
+                "set_id": set_id,
+                "face_lock": face_lock,
+            },
+        )
+        caption = f"{SETS[set_id]['title']}. Кадры 1–{made}."
+        if made < SET_SIZE:
+            caption += f" Сет остановился на кадре {made + 1}. Списаны токены только за готовые фото."
         try:
             await status.delete()
         except TelegramBadRequest:
             pass
+        sent = False
         try:
-            await message.answer_photo(
-                BufferedInputFile(image, filename="result.png"),
-                caption="Готово.",
-            )
-            await message.answer(
-                f"На счёте: {token_count(balance)}.\nОдна генерация — {token_count(GENERATION_COST)}.",
-                reply_markup=result_kb(mode),
-            )
+            if made == 1:
+                await message.answer_photo(BufferedInputFile(images[0], filename="set-1.png"), caption=caption)
+            else:
+                media = [
+                    InputMediaPhoto(
+                        media=BufferedInputFile(image, filename=f"set-{number}.png"),
+                        caption=caption if number == 1 else None,
+                    )
+                    for number, image in enumerate(images, start=1)
+                ]
+                await message.answer_media_group(media)
+            sent = True
         except Exception:
-            logger.exception("Failed to send generated photo")
-            returned = await add_credits(user_id, GENERATION_COST)
+            logger.exception("Photoset album failed, sending photos separately")
+            try:
+                for number, image in enumerate(images, start=1):
+                    await message.answer_photo(
+                        BufferedInputFile(image, filename=f"set-{number}.png"),
+                        caption=caption if number == 1 else None,
+                    )
+                sent = True
+            except Exception:
+                logger.exception("Failed to send photoset")
+        if sent:
+            fresh = await ensure_user(user_id)
+            tail = f"На счёте: {token_count(fresh['balance'])}.\nСет — {token_count(set_price(face_lock))}."
+            if error_text and made < SET_SIZE:
+                tail = f"{error_text}\n\n{tail}"
+            await message.answer(
+                tail,
+                reply_markup=result_kb(f"pmake:{set_id}:face" if face_lock else f"pmake:{set_id}", job_id),
+            )
+        else:
+            returned = await add_credits(user_id, charged)
             await message.answer(
                 f"Не удалось отправить фото. Токены возвращены. На счёте: {token_count(returned)}.",
                 reply_markup=main_kb(),
             )
-        await state.clear()
+    except Exception:
+        logger.exception("Photoset crashed")
+        returned = await add_credits(user_id, cost)
+        await message.answer(
+            f"Не получилось сгенерировать фото. Токены возвращены. На счёте: {token_count(returned)}.",
+            reply_markup=main_kb(),
+        )
     finally:
-        _busy.discard(user_id)
+        await _clear_if_same(state, started, token)
 
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
-    if message.from_user and message.from_user.id in _busy:
-        await message.answer("Генерация ещё идёт. Меню откроется после результата.")
-        return
     await state.clear()
     if message.from_user:
         _last_job.pop(message.from_user.id, None)
@@ -779,6 +1300,71 @@ async def on_ready(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
 
 
+@router.callback_query(F.data == "photosets")
+async def on_photosets(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Flow.garment)
+    if query.message and query.from_user:
+        await show_sets(query.message, query.from_user.id, edit=True)
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("pset:"))
+async def on_pset(query: CallbackQuery) -> None:
+    set_id = (query.data or "").split(":", 1)[1]
+    if set_id not in SETS or query.message is None:
+        await query.answer()
+        return
+    await send_set_examples(query.message, set_id)
+    user = await ensure_user(query.from_user.id)
+    if set_id == "5":
+        pose_line = "Пять поз случайно выбираются из загруженных образцов. С каждого берётся только стойка."
+    elif set_id == "3":
+        pose_line = "Пять кадров на белом фоне: спереди, сзади, слева, справа и по диагонали."
+    else:
+        pose_line = "Поза берётся из пяти образцов. С каждого копируется только стойка."
+    await query.message.answer(
+        f"{set_heading(set_id)}\n\n"
+        f"{pose_line} Пол, образ и происхождение остаются из настроек.\n"
+        f"Стоимость: {token_count(photoset_cost())}. На счёте: {token_count(user['balance'])}.",
+        reply_markup=make_set_kb(set_id),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("pmake:"))
+async def on_pmake(query: CallbackQuery, state: FSMContext) -> None:
+    parts = (query.data or "").split(":")
+    set_id = parts[1] if len(parts) > 1 else ""
+    face_lock = len(parts) > 2 and parts[2] == "face"
+    if set_id not in SETS or query.message is None:
+        await query.answer()
+        return
+    user = await ensure_user(query.from_user.id)
+    price = set_price(face_lock)
+    if int(user["balance"]) < price:
+        await query.answer(
+            f"Нужно {token_count(price)}, на счёте {token_count(user['balance'])}.",
+            show_alert=True,
+        )
+        return
+    await state.set_state(Flow.photoset)
+    await state.update_data(set_id=set_id, face_lock=face_lock)
+    if set_id == "3":
+        detail = "спереди, сзади, слева, справа и по диагонали, белый фон"
+    elif set_id == "5":
+        detail = "пять случайных поз"
+    else:
+        detail = "позы из образцов сета"
+    if face_lock:
+        detail += ", сохранение лица"
+    detail = f"{prefs_line(user, query.from_user.id)}\nСет: {detail}."
+    await query.message.answer(
+        confirm_text(f"{SETS[set_id]['title']}.", detail, int(user["balance"]), price),
+        reply_markup=back_kb(),
+    )
+    await query.answer()
+
+
 @router.callback_query(F.data == "examples")
 async def on_examples(query: CallbackQuery) -> None:
     files = example_files()
@@ -789,15 +1375,13 @@ async def on_examples(query: CallbackQuery) -> None:
         await query.answer("Примеры ещё не загружены", show_alert=True)
         return
     caption = (
-        "Два примера. По порядку: ваше фото, результат, ваше фото, результат.\n\n"
+        "По порядку пары: ваше фото, результат.\n\n"
         "Готовое изображение может немного отличаться от показанного примера."
     )
     await query.message.answer_media_group(
         [
-            InputMediaPhoto(media=FSInputFile(files[0]), caption=caption),
-            InputMediaPhoto(media=FSInputFile(files[1])),
-            InputMediaPhoto(media=FSInputFile(files[2])),
-            InputMediaPhoto(media=FSInputFile(files[3])),
+            InputMediaPhoto(media=FSInputFile(path), caption=caption if index == 0 else None)
+            for index, path in enumerate(files)
         ]
     )
     await query.answer()
@@ -824,8 +1408,10 @@ async def on_refs(query: CallbackQuery) -> None:
         await query.message.answer(REF_TEXT + "\n\nПримеры таких фото появятся здесь позже.")
         await query.answer()
         return
-    media = [InputMediaPhoto(media=FSInputFile(path)) for path in files]
-    media[0].caption = REF_TEXT
+    media = [
+        InputMediaPhoto(media=FSInputFile(path), caption=REF_TEXT if index == 0 else None)
+        for index, path in enumerate(files)
+    ]
     await query.message.answer_media_group(media)
     await query.answer()
 
@@ -837,9 +1423,14 @@ async def on_tryon(query: CallbackQuery, state: FSMContext) -> None:
         user = await ensure_user(query.from_user.id)
         await show(
             query.message,
-            "Пришлите своё фото.\n\n"
-            "Поза, лицо и фон сохранятся. Следующим сообщением попрошу фото одежды.\n"
-            f"Стоимость: {token_count(GENERATION_COST)}. На счёте: {token_count(user['balance'])}.",
+            confirm_text(
+                "Примерка на своё фото.",
+                "лицо, поза и фон с вашего фото. Настройки модели на этот режим не влияют.\n"
+                f"{extra_line(user)}",
+                int(user["balance"]),
+                GENERATION_COST,
+                "Пришлите своё фото. Следующим сообщением попрошу фото одежды.",
+            ),
             back_kb(),
             edit=True,
         )
@@ -869,20 +1460,35 @@ def product_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=label, callback_data=f"place:{key}")]
         for key, label in PLACEMENTS.items()
     ]
+    rows.append([InlineKeyboardButton(text="Добавить детали к запросу", callback_data="extra:product")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def place_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Добавить детали к запросу", callback_data="extra:place")],
+            [InlineKeyboardButton(text="Назад", callback_data="product")],
+        ]
+    )
+
+
+async def show_product(message: Message, user_id: int, *, edit: bool) -> None:
+    user = await ensure_user(user_id)
+    await show(
+        message,
+        f"Кадр вещи без человека. Куда её положить?\n\n{extra_line(user)}",
+        product_kb(),
+        edit=edit,
+    )
 
 
 @router.callback_query(F.data == "product")
 async def on_product(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if query.message:
-        await show(
-            query.message,
-            "Кадр вещи без человека. Куда её положить?",
-            product_kb(),
-            edit=True,
-        )
+        await show_product(query.message, query.from_user.id, edit=True)
     await query.answer()
 
 
@@ -897,10 +1503,13 @@ async def on_place(query: CallbackQuery, state: FSMContext) -> None:
     user = await ensure_user(query.from_user.id)
     await show(
         query.message,
-        f"Пришлите одно фото одежды.\n\n"
-        f"Соберу кадр: {PLACEMENTS[placement].lower()}, без человека.\n"
-        f"Стоимость: {token_count(GENERATION_COST)}. На счёте: {token_count(user['balance'])}.",
-        back_kb(),
+        confirm_text(
+            "Фото вещи.",
+            f"{PLACEMENTS[placement].lower()}, без человека.\n{extra_line(user)}",
+            int(user["balance"]),
+            GENERATION_COST,
+        ),
+        place_kb(),
         edit=True,
     )
     await query.answer()
@@ -909,14 +1518,18 @@ async def on_place(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "topup")
 async def on_topup(query: CallbackQuery) -> None:
     if query.message:
-        await show(
-            query.message,
+        offers = "\n".join(package_html(rubles, credits) for rubles, credits in PACKAGES)
+        text = (
             "Пополнение через СБП.\n\n"
+            f"{offers}\n\n"
             "Банк ещё не подключён. После подключения на выбранную сумму "
-            "бот пришлёт QR-код, а токены появятся после оплаты.",
-            topup_kb(),
-            edit=True,
+            "бот пришлёт QR-код, а токены появятся после оплаты."
         )
+        try:
+            await query.message.edit_text(text, reply_markup=topup_kb(), parse_mode="HTML")
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                await query.message.answer(text, reply_markup=topup_kb(), parse_mode="HTML")
     await query.answer()
 
 
@@ -929,8 +1542,10 @@ async def on_pay(query: CallbackQuery) -> None:
         return
     rubles, credits = package
     await query.message.answer(
-        f"Счёт на {rubles} ₽, это {token_count(credits)}.\n\n"
-        "Оплата по СБП ещё не подключена. Здесь появится QR-код."
+        f"{package_html(rubles, credits)}\n\n"
+        f"Счёт на {rubles} ₽, это {token_count(credits)} 💎.\n\n"
+        "Оплата по СБП ещё не подключена. Здесь появится QR-код.",
+        parse_mode="HTML",
     )
     await query.answer()
 
@@ -1020,6 +1635,8 @@ async def on_back(query: CallbackQuery, state: FSMContext) -> None:
             else:
                 await state.clear()
                 await show_settings(query.message, query.from_user.id, edit=True)
+        elif current == Flow.extra.state:
+            await show_after_extra(query.message, state, query.from_user.id, edit=True)
         elif current == Flow.garment.state:
             await show_clothes(query.message, query.from_user.id, edit=True)
         else:
@@ -1038,6 +1655,9 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
     current = await state.get_state()
     if current == Flow.regen.state:
         await message.answer("Напишите текстом, что исправить. Например: аккуратные волосы, цвет как на фото.")
+        return
+    if current == Flow.extra.state:
+        await message.answer("Напишите детали текстом или нажмите «Назад».")
         return
     uri = await photo_to_data_uri(bot, message)
     if not uri:
@@ -1060,6 +1680,16 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
             await show_clothes(message, message.from_user.id, edit=False)
         return
 
+    if current == Flow.photoset.state:
+        data = await state.get_data()
+        set_id = str(data.get("set_id") or "")
+        if set_id not in SETS:
+            await message.answer("Сначала выберите сет.", reply_markup=sets_kb())
+            return
+        face_lock = bool(data.get("face_lock"))
+        await run_photoset(message, state, uri, set_id, face_lock=face_lock)
+        return
+
     if current == Flow.garment.state:
         user = await ensure_user(message.from_user.id)
         pose = pose_photo(message.from_user.id, user)
@@ -1071,7 +1701,7 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
         prompt = prompt_for(user, pose_photo=bool(pose))
         ratio = aspect_for(user)
 
-        _last_job[message.from_user.id] = {
+        pending = {
             "kind": "clothes",
             "product": uri,
             "prompt": prompt,
@@ -1082,7 +1712,7 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
         async def job() -> bytes:
             return await fashn.generate_from_garment(uri, prompt, ratio, pose)
 
-        await run_generation(message, state, job, "clothes")
+        await run_generation(message, state, job, "clothes", pending)
         return
 
     if current == Flow.hanger.state:
@@ -1090,17 +1720,20 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
         placement = data.get("placement")
         if placement not in PLACEMENTS:
             placement = "hanger"
+        user = await ensure_user(message.from_user.id)
+        own = user_extra(user)
 
-        _last_job[message.from_user.id] = {
+        pending = {
             "kind": "place",
             "product": uri,
             "placement": str(placement),
+            "extra": own,
         }
 
         async def hanger_job() -> bytes:
-            return await fashn.generate_on_hanger(uri, str(placement))
+            return await fashn.generate_on_hanger(uri, str(placement), own, packshot_context(str(placement)))
 
-        await run_generation(message, state, hanger_job, f"place:{placement}")
+        await run_generation(message, state, hanger_job, f"place:{placement}", pending)
         return
 
     if current == Flow.person.state:
@@ -1117,16 +1750,19 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
             await message.answer("Сначала пришлите своё фото.", reply_markup=back_kb())
             return
 
-        _last_job[message.from_user.id] = {
+        user = await ensure_user(message.from_user.id)
+        own = user_extra(user)
+        pending = {
             "kind": "tryon",
             "product": uri,
             "person": person,
+            "extra": own,
         }
 
         async def job() -> bytes:
-            return await fashn.generate_tryon(uri, person)
+            return await fashn.generate_tryon(uri, person, own)
 
-        await run_generation(message, state, job, "tryon")
+        await run_generation(message, state, job, "tryon", pending)
         return
 
     await message.answer("Сначала выберите действие кнопкой.", reply_markup=main_kb())
@@ -1137,24 +1773,133 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot) -> None:
 @router.message(Flow.tryon_garment, ~F.photo)
 @router.message(Flow.hanger, ~F.photo)
 @router.message(Flow.pose, ~F.photo)
+@router.message(Flow.photoset, ~F.photo)
 async def not_photo(message: Message) -> None:
     if message.text and message.text.startswith("/"):
         return
     await message.answer("Пришлите изображение, не файл и не текст.")
 
 
-@router.callback_query(F.data == "regen")
+async def show_after_extra(message: Message, state: FSMContext, user_id: int, *, edit: bool) -> None:
+    data = await state.get_data()
+    back = data.get("extra_back")
+    if back == "clothes":
+        await state.set_state(Flow.garment)
+        await show_clothes(message, user_id, edit=edit)
+        return
+    if back == "product":
+        await state.clear()
+        await show_product(message, user_id, edit=edit)
+        return
+    if back == "place":
+        placement = data.get("placement")
+        if placement not in PLACEMENTS:
+            await state.clear()
+            await show_product(message, user_id, edit=edit)
+            return
+        await state.set_state(Flow.hanger)
+        await state.update_data(placement=placement)
+        user = await ensure_user(user_id)
+        await show(
+            message,
+            confirm_text(
+                "Фото вещи.",
+                f"{PLACEMENTS[str(placement)].lower()}, без человека.\n{extra_line(user)}",
+                int(user["balance"]),
+                GENERATION_COST,
+            ),
+            place_kb(),
+            edit=edit,
+        )
+        return
+    await state.clear()
+    await show_settings(message, user_id, edit=edit)
+
+
+@router.callback_query(F.data.in_({"extra", "extra:product", "extra:place"}))
+async def on_extra(query: CallbackQuery, state: FSMContext) -> None:
+    if query.message is None:
+        await query.answer()
+        return
+    raw = query.data or "extra"
+    current = await state.get_state()
+    if raw == "extra:product":
+        back = "product"
+    elif raw == "extra:place":
+        back = "place"
+    elif current == Flow.garment.state:
+        back = "clothes"
+    else:
+        back = "settings"
+    await state.set_state(Flow.extra)
+    await state.update_data(extra_back=back)
+    user = await ensure_user(query.from_user.id)
+    await show(
+        query.message,
+        "Напишите детали, которые добавить к запросу.\n\n"
+        f"{extra_line(user)}\n\n"
+        "Текст добавится к генерации по фото, фотосету, примерке и фото вещи.",
+        extra_kb(bool(user_extra(user))),
+        edit=True,
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data == "extra_clear")
+async def on_extra_clear(query: CallbackQuery, state: FSMContext) -> None:
+    if query.message is None:
+        await query.answer()
+        return
+    await update_prefs(query.from_user.id, extra="")
+    await show_after_extra(query.message, state, query.from_user.id, edit=True)
+    await query.answer("Свой промпт убран")
+
+
+@router.message(Flow.extra, F.text)
+async def on_extra_text(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not message.text or message.text.startswith("/"):
+        return
+    text = " ".join(message.text.split())[:300]
+    if not text:
+        await message.answer("Напишите детали текстом.")
+        return
+    await update_prefs(message.from_user.id, extra=text)
+    await message.answer(f"Свой промпт: {text}")
+    await show_after_extra(message, state, message.from_user.id, edit=False)
+
+
+@router.callback_query(F.data.startswith("regen"))
 async def on_regen(query: CallbackQuery, state: FSMContext) -> None:
-    if query.from_user.id not in _last_job:
+    raw = query.data or ""
+    job_id = raw.split(":", 1)[1] if raw.startswith("regen:") else ""
+    last = _jobs.get(job_id) if job_id else None
+    if last is None:
+        last = _last_job.get(query.from_user.id)
+    if not last:
         await query.answer("Сначала получите фото, потом его можно перегенерировать.", show_alert=True)
         return
+    _last_job[query.from_user.id] = last
     await state.set_state(Flow.regen)
+    await state.update_data(regen_job=job_id)
     if query.message:
-        await query.message.answer(
-            f"Перегенерация стоит {token_count(GENERATION_COST)}.\n\n"
-            "Напишите, что изменить. Комментарий добавится к запросу. "
-            "Исходное фото одежды и выбранная поза останутся теми же."
-        )
+        if last.get("kind") == "photoset":
+            price = set_price(bool(last.get("face_lock")))
+            text = (
+                f"Перегенерация сета стоит {token_count(price)}.\n\n"
+                f"Сейчас: {SETS.get(str(last.get('set_id')), {}).get('title', 'Сет')}"
+                f"{', сохранение лица' if last.get('face_lock') else ''}.\n\n"
+                f"{DISCLAIMER}\n\n"
+                "Напишите, что изменить. Комментарий добавится ко всем 5 кадрам. "
+                "Одежда останется той же."
+            )
+        else:
+            text = (
+                f"Перегенерация стоит {token_count(GENERATION_COST)}.\n\n"
+                f"{DISCLAIMER}\n\n"
+                "Напишите, что изменить. Комментарий добавится к запросу. "
+                "Исходное фото одежды и выбранная поза останутся теми же."
+            )
+        await query.message.answer(text)
     await query.answer()
 
 
@@ -1166,12 +1911,26 @@ async def on_regen_text(message: Message, state: FSMContext) -> None:
     if not note:
         await message.answer("Напишите, что исправить.")
         return
-    last = _last_job.get(message.from_user.id)
+    data = await state.get_data()
+    job_id = str(data.get("regen_job") or "")
+    last = _jobs.get(job_id) if job_id else None
+    if last is None:
+        last = _last_job.get(message.from_user.id)
     if not last:
         await state.clear()
         await message.answer("Исходное фото уже не сохранено. Пришлите его ещё раз.", reply_markup=main_kb())
         return
     kind = last.get("kind")
+    if kind == "photoset":
+        await run_photoset(
+            message,
+            state,
+            str(last["product"]),
+            str(last.get("set_id") or ""),
+            note,
+            face_lock=bool(last.get("face_lock")),
+        )
+        return
 
     async def job() -> bytes:
         if kind == "clothes":
@@ -1183,10 +1942,20 @@ async def on_regen_text(message: Message, state: FSMContext) -> None:
                 str(last.get("pose") or ""),
             )
         if kind == "tryon":
-            return await fashn.generate_tryon(str(last["product"]), str(last["person"]), note)
-        return await fashn.generate_on_hanger(str(last["product"]), str(last.get("placement") or "hanger"), note)
+            saved = str(last.get("extra") or "")
+            combined = " ".join(part for part in (saved, note) if part)
+            return await fashn.generate_tryon(str(last["product"]), str(last["person"]), combined)
+        saved = str(last.get("extra") or "")
+        combined = " ".join(part for part in (saved, note) if part)
+        return await fashn.generate_on_hanger(
+            str(last["product"]),
+            str(last.get("placement") or "hanger"),
+            combined,
+            packshot_context(str(last.get("placement") or "")),
+        )
 
-    await run_generation(message, state, job, "clothes" if kind == "clothes" else "tryon" if kind == "tryon" else f"place:{last.get('placement') or 'hanger'}")
+    mode = "clothes" if kind == "clothes" else "tryon" if kind == "tryon" else f"place:{last.get('placement') or 'hanger'}"
+    await run_generation(message, state, job, mode, last)
 
 
 @router.message(F.text)
